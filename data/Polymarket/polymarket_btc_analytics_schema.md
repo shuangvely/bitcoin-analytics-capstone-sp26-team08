@@ -1,18 +1,6 @@
 # Polymarket Finance & Politics Parquet Schemas
 
-This document details the schemas for the 6 Parquet files. All files are located in `data/Polymarket/`.
-
-## Timestamp Integrity Notes
-Some Polymarket parquet files contain timestamp columns that are stored with
-incorrect units. Values are effectively millisecond epoch timestamps but are
-encoded with microsecond metadata, which makes raw reads appear as dates near
-1970. The runtime loaders in `template/prelude_template.py` and
-`eda/eda_starter_template.py` correct this by detecting pre-2020 maxima and
-scaling the underlying integer values before enforcing a 2020+ constraint
-(invalid placeholders are set to null/NaT).
-
-If you read the parquet files directly (e.g., `pd.read_parquet()`), you will
-see the corrupted timestamps. Always use the provided loaders for analysis.
+This document details the schemas for the 6 Parquet files exported from the Polymarket DuckDB. All files are located in `bitcoin_project_polymarket/parquet_export/`.
 
 ---
 
