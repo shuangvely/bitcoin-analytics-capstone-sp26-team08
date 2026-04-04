@@ -456,17 +456,17 @@ def load_whale_signal(
 def load_risk_regime_modifier(
     odds_df: pd.DataFrame,
     index: pd.DatetimeIndex,
+    tokens_df: pd.DataFrame,  
 ) -> pd.Series:
     """Compute a regime-aware multiplier from the Polymarket odds-history risk index.
 
-    EDA finding: higher risk index (7-day vol of PM probabilities) co-moves with
-    higher BTC prices. This reflects bull-market phase, NOT a causal predictor.
+    EDA finding: low to moderate risk co moves with 7D forward BTC price, using volatility of log-odds as a better 
+    measure of informational velocity than raw probability difference
 
-    Interpretation for DCA:
-      High risk index → market is likely in an elevated/bull phase → BTC expensive
-        → dampen the MVRV "buy more" signal (MVRV might look neutral but price is high)
-      Low risk index  → market in a bear/early phase → BTC likely cheap
-        → allow slight amplification of the MVRV "buy more" signal
+    Interpretation for DCA - this is a different or almost opposite finding from initial EDA due to
+    change of vol calculation methodology
+      Low risk index (Calm) -> Accumulation phase -> Amplify buying (RISK_LOW_AMPLIFY)
+      High risk index (Chaos) -> Exhaustion phase -> Dampen buying (RISK_HIGH_DAMPEN)
 
     This is applied as a MULTIPLICATIVE FILTER on the MVRV value signal component,
     not as an independent additive signal, to avoid spurious alpha claims.
@@ -488,36 +488,42 @@ def load_risk_regime_modifier(
     """
     neutral = pd.Series(1.0, index=index, name="risk_regime_modifier")
 
-    if odds_df is None or odds_df.empty:
+    if odds_df is None or odds_df.empty or tokens_df is None or tokens_df.empty:
         logging.warning("risk_regime_modifier: odds_df empty, returning 1.0 always.")
         return neutral
+    
+    # Join Odds with Tokens to get 'Outcome' labels 
+    tokens_sub = tokens_df[["market_id", "token_id", "outcome"]].copy()
+    tokens_sub["outcome_lower"] = tokens_sub["outcome"].str.lower()
 
-    odds = odds_df.copy()
+    # Perform the join
+    odds = odds_df.merge(tokens_sub, on=["market_id", "token_id"], how="inner")
 
-    # ── Normalise timestamps to daily ────────────────────────────────────────
+    # Filter for 'Yes' or 'Up' to ensure we only look at one side of the binary pair
+    odds = odds[odds["outcome_lower"].isin(["yes", "up"])]
+
+    # Normalise timestamps to daily 
     odds["date"] = pd.to_datetime(odds["timestamp"], utc=True, errors="coerce").dt.tz_localize(None).dt.normalize()
     odds = odds.dropna(subset=["date", "price"])
 
-    # ── Daily probability snapshot: last price per (market_id, token_id, date) ──
-    daily_close = (
-        odds.sort_values("timestamp")
-        .groupby(["market_id", "token_id", "date"])["price"]
-        .last()
-        .reset_index()
+    # Logit Transformation & Volatility 
+    # Clip to avoid log(0)
+    daily_close["p_clipped"] = daily_close["price"].clip(1e-4, 1 - 1e-4)
+    daily_close["logit_p"] = np.log(daily_close["p_clipped"] / (1 - daily_close["p_clipped"]))
+
+    # Calculate 7-day rolling logit volatility per market
+    daily_close = daily_close.sort_values(["market_id", "date"])
+    daily_close["logit_diff"] = daily_close.groupby("market_id")["logit_p"].diff()
+    
+    daily_close["logit_vol_7d"] = (
+        daily_close.groupby("market_id")["logit_diff"]
+        .transform(lambda s: s.rolling(RISK_VOL_WINDOW, min_periods=4).std())
     )
 
-    # ── 7-day intra-cross-market probability volatility ───────────────────────
-    # For each (market_id, token_id): compute 7-day rolling std of price
-    # Then take the cross-market mean of that volatility each day
-    daily_close = daily_close.sort_values(["market_id", "token_id", "date"])
-    daily_close["prob_vol_7d"] = (
-        daily_close.groupby(["market_id", "token_id"])["price"]
-        .transform(lambda s: s.rolling(RISK_VOL_WINDOW, min_periods=2).std())
-    )
 
     # Cross-market daily mean volatility → the "risk index"
     risk_index = (
-        daily_close.groupby("date")["prob_vol_7d"]
+        daily_close.groupby("date")["logit_vol_7d"]
         .mean()
         .reindex(index, fill_value=np.nan)
         .ffill()
