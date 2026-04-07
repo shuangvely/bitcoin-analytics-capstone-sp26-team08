@@ -142,19 +142,33 @@ def load_polymarket_data() -> dict[str, pd.DataFrame]:
                 for col in df.columns:
                     if any(x in col.lower() for x in ["timestamp", "trade", "created_at", "end_date"]):
                         if pd.api.types.is_datetime64_any_dtype(df[col]):
-                            if not df[col].empty and df[col].max() < pd.Timestamp("2020-01-01"):
-                                logging.info(f"  Fixing corrupted timestamps in column: {col}")
-                                # Scale up by 1000 to correct seconds-as-ms bug.
-                                # Use astype('datetime64[ns]') to ensure we are working with nanoseconds
-                                # before scaling, then convert back.
-                                ns_values = df[col].values.astype("datetime64[ns]").astype("int64")
-                                df[col] = pd.to_datetime(ns_values * 1000)
-                                
-                            # Enforce 2020+ constraint (replace placeholders/zeros with NaT)
                             if not df[col].empty:
-                                mask = df[col] < pd.Timestamp("2020-01-01")
-                                if mask.any():
-                                    df.loc[mask, col] = pd.NaT
+                                col_max = df[col].max()
+                                col_min = df[col].dropna().min() if df[col].notna().any() else None
+
+                                # Case 1: timestamps read as pre-2020 → stored as seconds, treated as ms
+                                # Multiply int64 by 1000 to shift from ms→us scale
+                                if pd.notna(col_max) and col_max < pd.Timestamp("2020-01-01"):
+                                    logging.info(f"  Fixing pre-2020 timestamps in: {col}")
+                                    ns_values = df[col].values.astype("datetime64[ns]").astype("int64")
+                                    df[col] = pd.to_datetime(ns_values * 1000)
+
+                                # Case 2: timestamps read as post-2030 → stored as seconds, treated as us
+                                # Divide int64 by 1_000_000 to recover the true Unix second value
+                                elif pd.notna(col_max) and col_max > pd.Timestamp("2030-01-01"):
+                                    logging.info(f"  Fixing post-2030 timestamps in: {col} (us→s correction)")
+                                    ns_values = df[col].values.astype("datetime64[ns]").astype("int64")
+                                    # ns_values are in nanoseconds; stored value was seconds × 1_000_000 (us)
+                                    # so actual seconds = ns_values / 1_000_000_000 / 1_000_000 * 1_000_000_000
+                                    # simplified: divide int64 by 1_000_000 then reinterpret as ns
+                                    corrected_ns = (ns_values // 1_000_000) * 1_000_000_000
+                                    df[col] = pd.to_datetime(corrected_ns, unit="ns")
+
+                                # Enforce 2020+ constraint regardless of which case applied
+                                if not df[col].empty:
+                                    mask = df[col].notna() & (df[col] < pd.Timestamp("2020-01-01"))
+                                    if mask.any():
+                                        df.loc[mask, col] = pd.NaT
                                 
                 data[key] = df
                 logging.info(f"  Loaded {len(df)} rows from {filename}")

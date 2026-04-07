@@ -63,7 +63,7 @@ from template.model_development_template import (
 # Re-use helpers from example_1 that we don't need to duplicate
 # ---------------------------------------------------------------------------
 from example_1.model_development_example_1 import (
-    load_polymarket_btc_sentiment,  # existing PM BTC market-activity sentiment
+    #load_polymarket_btc_sentiment,  # existing PM BTC market-activity sentiment
     zscore,
     classify_mvrv_zone,
     compute_mvrv_volatility,
@@ -135,10 +135,10 @@ RISK_HIGH_DAMPEN = 0.82         # Multiply MVRV when in high-risk (bull) regime
 RISK_LOW_AMPLIFY = 1.15         # Multiply MVRV when in low-risk (bear) regime
 
 # Combined signal weights (must sum to 1.0 across additive components)
-W_MVRV = 0.40
+W_MVRV = 0.45
 W_MA = 0.12
-W_PM_SENTIMENT = 0.08
-W_CHURN = 0.18
+#W_PM_SENTIMENT = 0.08
+W_CHURN = 0.21
 W_WHALE = 0.10
 # Macro modifier and risk-regime filter are multiplicative, not additive.
 # The remaining 0.12 is absorbed by those two gates naturally.
@@ -152,7 +152,7 @@ FEATS = [
     "mvrv_zone",
     "mvrv_volatility",
     "signal_confidence",
-    "polymarket_sentiment",
+    # remove this feature "polymarket_sentiment",
     # New features
     "churn_signal",
     "macro_modifier",
@@ -603,16 +603,16 @@ def precompute_features(df: pd.DataFrame) -> pd.DataFrame:
         mvrv_zone = pd.Series(0, index=price.index)
         mvrv_volatility = pd.Series(0.5, index=price.index)
 
-    # ── Existing PM BTC sentiment (unchanged from example_1) ─────────────────
-    try:
-        pm_btc_df = load_polymarket_btc_sentiment()
-        polymarket_sentiment = (
-            pm_btc_df["polymarket_sentiment"].reindex(price.index, fill_value=0.5)
-            if not pm_btc_df.empty else pd.Series(0.5, index=price.index)
-        )
-    except Exception as e:
-        logging.warning(f"PM BTC sentiment unavailable: {e}")
-        polymarket_sentiment = pd.Series(0.5, index=price.index)
+    # # ── Existing PM BTC sentiment (unchanged from example_1) ─────────────────
+    # try:
+    #     pm_btc_df = load_polymarket_btc_sentiment()
+    #     polymarket_sentiment = (
+    #         pm_btc_df["polymarket_sentiment"].reindex(price.index, fill_value=0.5)
+    #         if not pm_btc_df.empty else pd.Series(0.5, index=price.index)
+    #     )
+    # except Exception as e:
+    #     logging.warning(f"PM BTC sentiment unavailable: {e}")
+    #     polymarket_sentiment = pd.Series(0.5, index=price.index)
 
     # ── Signal 1: Active churn ────────────────────────────────────────────────
     # Computed from on-chain columns already in df — no external load needed
@@ -647,7 +647,7 @@ def precompute_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # ── Signal 4: Risk regime modifier ───────────────────────────────────────
     try:
-        risk_raw = load_risk_regime_modifier(odds_df_pd, price.index)
+        risk_raw = load_risk_regime_modifier(odds_df_pd, price.index,tokens_df_pd)
     except Exception as e:
         logging.warning(f"risk_regime_modifier failed: {e}")
         risk_raw = pd.Series(1.0, index=price.index)
@@ -665,7 +665,7 @@ def precompute_features(df: pd.DataFrame) -> pd.DataFrame:
             "mvrv_zone": mvrv_zone,
             "mvrv_volatility": mvrv_volatility,
             "signal_confidence": 0.5,       # Computed post-lag below
-            "polymarket_sentiment": polymarket_sentiment,
+            #"polymarket_sentiment": polymarket_sentiment,
             # New signals 
             "churn_signal": churn_raw.reindex(price.index, fill_value=0.0),
             "macro_modifier": macro_modifier_raw.reindex(price.index, fill_value=1.0),
@@ -683,7 +683,7 @@ def precompute_features(df: pd.DataFrame) -> pd.DataFrame:
         "mvrv_acceleration",
         "mvrv_zone",
         "mvrv_volatility",
-        "polymarket_sentiment",
+        #"polymarket_sentiment",
         "churn_signal",
         "macro_modifier",
         "whale_signal",
@@ -694,7 +694,7 @@ def precompute_features(df: pd.DataFrame) -> pd.DataFrame:
     # ── Fill NaN with safe defaults ───────────────────────────────────────────
     features["mvrv_zone"] = features["mvrv_zone"].fillna(0)
     features["mvrv_volatility"] = features["mvrv_volatility"].fillna(0.5)
-    features["polymarket_sentiment"] = features["polymarket_sentiment"].fillna(0.5)
+    #features["polymarket_sentiment"] = features["polymarket_sentiment"].fillna(0.5)
     features["churn_signal"] = features["churn_signal"].fillna(0.0)
     features["macro_modifier"] = features["macro_modifier"].fillna(1.0)
     features["whale_signal"] = features["whale_signal"].fillna(0.0)
@@ -723,7 +723,7 @@ def compute_dynamic_multiplier(
     mvrv_acceleration: np.ndarray | None = None,
     mvrv_volatility: np.ndarray | None = None,
     signal_confidence: np.ndarray | None = None,
-    polymarket_sentiment: np.ndarray | None = None,
+    #polymarket_sentiment: np.ndarray | None = None,
     # New parameters
     churn_signal: np.ndarray | None = None,
     macro_modifier: np.ndarray | None = None,
@@ -773,8 +773,8 @@ def compute_dynamic_multiplier(
         mvrv_volatility = np.full(n, 0.5)
     if signal_confidence is None:
         signal_confidence = np.full(n, 0.5)
-    if polymarket_sentiment is None:
-        polymarket_sentiment = np.full(n, 0.5)
+    #if polymarket_sentiment is None:
+        #polymarket_sentiment = np.full(n, 0.5)
     if churn_signal is None:
         churn_signal = np.zeros(n)
     if macro_modifier is None:
@@ -796,7 +796,7 @@ def compute_dynamic_multiplier(
     ma_signal = ma_signal * trend_modifier
 
     # ── 3. PM BTC sentiment (re-centred from [0,1] to [-0.1, 0.1]) ───────────
-    polymarket_signal = (polymarket_sentiment - 0.5) * 0.2
+    #polymarket_signal = (polymarket_sentiment - 0.5) * 0.2
 
     # ── 4. Active churn signal (Signal 1) ────────────────────────────────────
     # Already in approximately [-2, 2]; scale to a reasonable contribution range
@@ -811,7 +811,7 @@ def compute_dynamic_multiplier(
     combined = (
         value_signal      * W_MVRV           # 40%
         + ma_signal       * W_MA             # 12%
-        + polymarket_signal * W_PM_SENTIMENT  # 8%
+        #+ polymarket_signal * W_PM_SENTIMENT  # 8%
         + churn_contrib   * W_CHURN          # 18%
         + whale_contrib   * W_WHALE          # 10%
     )
@@ -899,9 +899,9 @@ def compute_weights_fast(
     signal_confidence = np.where(
         _get("signal_confidence", 0.5) == 0, 0.5, _get("signal_confidence", 0.5)
     )
-    polymarket_sentiment = np.where(
-        _get("polymarket_sentiment", 0.5) == 0, 0.5, _get("polymarket_sentiment", 0.5)
-    )
+    # polymarket_sentiment = np.where(
+    #     _get("polymarket_sentiment", 0.5) == 0, 0.5, _get("polymarket_sentiment", 0.5)
+    # )
     churn_signal         = _get("churn_signal", 0.0)
     macro_modifier       = np.where(
         _get("macro_modifier", 1.0) == 0, 1.0, _get("macro_modifier", 1.0)
@@ -918,7 +918,7 @@ def compute_weights_fast(
         mvrv_acceleration=mvrv_acceleration,
         mvrv_volatility=mvrv_volatility,
         signal_confidence=signal_confidence,
-        polymarket_sentiment=polymarket_sentiment,
+        #polymarket_sentiment=polymarket_sentiment,
         churn_signal=churn_signal,
         macro_modifier=macro_modifier,
         whale_signal=whale_signal,
@@ -966,7 +966,7 @@ def compute_window_weights(
             ("mvrv_zone", 0),
             ("mvrv_volatility", 0.5),
             ("signal_confidence", 0.5),
-            ("polymarket_sentiment", 0.5),
+            #("polymarket_sentiment", 0.5),
             ("macro_modifier", 1.0),
             ("risk_regime_modifier", 1.0),
         ]:
