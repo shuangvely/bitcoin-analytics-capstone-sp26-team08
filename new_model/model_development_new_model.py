@@ -5,39 +5,32 @@ derived from on-chain and Polymarket data:
 
   Signal 1 — Active Churn Window (on-chain)
       Best accumulation happens when net exchange flow is moderate-positive
-      AND active address count is elevated. Not during panic extremes.
-      Source columns: FlowInExUSD, FlowOutExUSD, AdrActCnt (CoinMetrics)
+      AND active address count is elevated. 
 
   Signal 2 — Macro Event Volatility (Polymarket markets)
       Two sub-signals:
-        a) Event proximity dampener: as days-to-resolution shrinks, reduce
-           signal volatility (market is pricing in outcome → less uncertainty).
+        a) Event proximity dampener
         b) Event activity gate: "No active events" regime elevates downside
-           risk → dampen buying. Moderate-high event intensity → allow full signal.
-      Source: finance_politics_markets.parquet (end_date, category)
+           risk → dampen buying. 
 
   Signal 3 — Whale / Smart Money Precursor (Polymarket trades)
       Size-weighted directional signal from large trades (>$10k notional).
-      Big bets on crypto-bullish outcomes → positive signal, and vice versa.
-      Applied with a 7-day EMA to reduce noise.
       Source: finance_politics_trades.parquet + finance_politics_tokens.parquet
 
   Signal 4 — Polymarket Risk Index Lead Indicator (Polymarket odds history)
       7-day rolling volatility of prediction market probabilities is a
-      regime indicator: high risk index coincides with high BTC prices (bull phase).
-      Used as a multiplicative regime filter on the MVRV signal — NOT a raw
-      buy signal — to prevent leakage. Lagged 1 day strictly.
+      regime indicator: Used as a multiplicative regime filter on the MVRV signal
       Source: finance_politics_odds_history.parquet
 
 All new features are lagged 1 day in precompute_features() to prevent
 look-ahead bias. The existing MVRV + MA + PM-BTC-sentiment pipeline from
-example_1 is preserved intact and imported directly.
+example_1 is preserved intact and imported directly, thought PM-BTC-sentiment weight 
+is dropped given Macro modifier's similar effect on total event count
 
 Weight allocation in compute_dynamic_multiplier():
-  MVRV value signal     40%  (core valuation anchor, unchanged from example_1)
+  MVRV value signal     45%  (core valuation anchor, unchanged from example_1)
   200-day MA signal     12%  (trend context, unchanged)
-  PM BTC sentiment      8%   (reduced from 20% to make room for new signals)
-  Active churn          18%  (Signal 1 — new)
+  Active churn          21%  (Signal 1 — new)
   Macro modifier        multiplicative gate on combined output (Signal 2)
   Whale signal          10%  (Signal 3 — new, additive)
   Risk regime filter    multiplicative gate on MVRV component (Signal 4)
@@ -60,7 +53,7 @@ from template.model_development_template import (
 )
 
 # ---------------------------------------------------------------------------
-# Re-use helpers from example_1 that we don't need to duplicate
+# Re-use helpers from example_1
 # ---------------------------------------------------------------------------
 from example_1.model_development_example_1 import (
     #load_polymarket_btc_sentiment,  # existing PM BTC market-activity sentiment
@@ -115,10 +108,11 @@ CHURN_NETFLOW_WEIGHT = 0.6      # Within churn composite
 CHURN_ADR_WEIGHT = 0.4          # Within churn composite
 
 # Signal 2: Macro event
-MACRO_CRYPTO_CATEGORIES = {"crypto", "business", "politics"}
+MACRO_CRYPTO_CATEGORIES = {"crypto", "business", "politics","US-current-affairs"}
 MACRO_EVENT_WINDOW = 30         # Rolling window for event-count percentile
 MACRO_NO_EVENT_DAMPENER = 0.75  # Multiply combined signal when no events active
 MACRO_PROXIMITY_MIN = 0.60      # Floor for proximity dampener (day before resolution)
+SIGNIFICANCE_THRESHOLD = 10000  # $10k minimum volume to be considered "Macro"
 
 # Signal 3: Whale smart money
 WHALE_MIN_NOTIONAL = 10000      # USD notional threshold for "big bet"
@@ -171,13 +165,9 @@ def compute_churn_signal(df: pd.DataFrame) -> pd.Series:
 
     Logic (from EDA):
       - MVRV Q1 + NetFlow Q2-Q3 produces highest 30-day forward returns.
-      - AdrActCnt is nearly uncorrelated with price → carries independent info.
+      - AdrActCnt is nearly uncorrelated with price
       - Best accumulation: moderate net outflow + elevated active addresses.
       - Extreme net outflow (Q5) had LOWER returns than moderate outflow → clip.
-
-    Args:
-        df: DataFrame with FlowInExUSD, FlowOutExUSD, AdrActCnt columns,
-            covering the full available history (pre-lag).
 
     Returns:
         Daily churn_signal series in approximately [-2, 2], higher = more
@@ -224,21 +214,14 @@ def load_macro_event_features(markets_df: pd.DataFrame, index: pd.DatetimeIndex)
 
     Sub-signal A — proximity_dampener  [MACRO_PROXIMITY_MIN, 1.0]
         As days_to_resolution shrinks → value decreases toward MACRO_PROXIMITY_MIN.
-        Rationale: price variance narrows near resolution (EDA: democratic-nominee
-        example). Reduce position-sizing volatility when a major event is imminent.
+        Rationale: price variance narrows near resolution
+        Reduce position-sizing volatility when a major event is imminent.
 
     Sub-signal B — event_activity_gate  {MACRO_NO_EVENT_DAMPENER, 1.0}
-        No active events → elevated downside risk (EDA: No_Event = highest dd prob).
+        No active events → elevated downside risk 
         Q3-Q4 event intensity → lower drawdown probability → full signal allowed.
 
     Both sub-signals are combined multiplicatively as macro_modifier.
-    NOTE: These are already "safe" features (computed from market metadata,
-    not outcome prices) and will be lagged 1 day by precompute_features().
-
-    Args:
-        markets_df: Pandas DataFrame loaded from finance_politics_markets.parquet.
-                    Must have columns: created_at, end_date, category, volume.
-        index: Target date index (full CoinMetrics date range).
 
     Returns:
         DataFrame with columns [proximity_dampener, event_activity_gate,
@@ -259,7 +242,7 @@ def load_macro_event_features(markets_df: pd.DataFrame, index: pd.DatetimeIndex)
 
     # Keep only crypto-relevant categories
     relevant = markets_df[
-        markets_df["category"].str.lower().isin(MACRO_CRYPTO_CATEGORIES)
+        markets_df["category"].str.lower().str.contains("|".join(MACRO_CRYPTO_CATEGORIES),na=False)
     ].copy()
 
     if relevant.empty:
@@ -273,7 +256,7 @@ def load_macro_event_features(markets_df: pd.DataFrame, index: pd.DatetimeIndex)
 
     relevant = relevant.dropna(subset=["end_date"])
 
-    # ── Sub-signal A: proximity dampener ────────────────────────────────────
+    # Sub-signal A: proximity dampener 
     # For each calendar day, find the minimum days-to-resolution across all
     # currently active markets. A short fuse = high proximity = low dampener.
     days_index = index.normalize()
@@ -282,15 +265,14 @@ def load_macro_event_features(markets_df: pd.DataFrame, index: pd.DatetimeIndex)
     def min_days_remaining(date: pd.Timestamp) -> float:
         active = relevant[
             (relevant.get("created_at", pd.Timestamp.min) <= date)
-            & (relevant["end_date"] >= date)
+            & (relevant["end_date"] >= date) &
+            (relevant["volume"] >= SIGNIFICANCE_THRESHOLD) #<--- filter significant event
         ]
         if active.empty:
             return np.nan
         days = (active["end_date"] - date).dt.days
         return float(days[days >= 0].min()) if (days >= 0).any() else np.nan
 
-    # This loop is O(dates × markets) — acceptable for ~2000 days × a few thousand markets.
-    # For very large datasets, vectorise with a merge-asof approach instead.
     min_days = pd.Series(
         [min_days_remaining(d) for d in days_index],
         index=index,
@@ -305,9 +287,8 @@ def load_macro_event_features(markets_df: pd.DataFrame, index: pd.DatetimeIndex)
     )
     proximity_dampener = proximity_dampener.clip(MACRO_PROXIMITY_MIN, 1.0)
 
-    # ── Sub-signal B: event activity gate ───────────────────────────────────
+    # Sub-signal B: event activity gate 
     # Count active markets per day (created_at <= date <= end_date)
-    # Use a vectorised merge approach for efficiency
     relevant["date_start"] = relevant["created_at"].dt.normalize()
     relevant["date_end"] = relevant["end_date"].dt.normalize()
 
@@ -327,7 +308,7 @@ def load_macro_event_features(markets_df: pd.DataFrame, index: pd.DatetimeIndex)
     event_gate = np.where(active_pct < 0.10, MACRO_NO_EVENT_DAMPENER, 1.0)
     event_gate = pd.Series(event_gate, index=index, dtype=float)
 
-    # ── Combine ──────────────────────────────────────────────────────────────
+    # Combine
     result["proximity_dampener"] = proximity_dampener
     result["event_activity_gate"] = event_gate
     result["macro_modifier"] = (proximity_dampener * event_gate).clip(
@@ -359,14 +340,6 @@ def load_whale_signal(
     The raw daily directional mass is smoothed with a 7-day EMA then
     z-scored for normalisation.
 
-    Args:
-        trades_df: DataFrame from finance_politics_trades.parquet.
-                   Columns: timestamp, market_id, token_id, price, size, side.
-        tokens_df: DataFrame from finance_politics_tokens.parquet.
-                   Columns: market_id, token_id, outcome.
-        markets_df: DataFrame from finance_politics_markets.parquet.
-                    Columns: market_id, category.
-        index: Target date index.
 
     Returns:
         Daily whale_signal series in approximately [-2, 2], higher = more
@@ -382,32 +355,33 @@ def load_whale_signal(
     tokens = tokens_df.copy() if tokens_df is not None else pd.DataFrame()
     markets = markets_df.copy() if markets_df is not None else pd.DataFrame()
 
-    # ── Normalise timestamps ─────────────────────────────────────────────────
+    # Normalise timestamps 
     trades["date"] = pd.to_datetime(trades["timestamp"], utc=True, errors="coerce").dt.tz_localize(None).dt.normalize()
     trades = trades.dropna(subset=["date", "price", "size", "side"])
 
-    # ── Compute notional and keep only whale trades ──────────────────────────
+    # Compute notional and keep only whale trades 
     trades["notional"] = trades["price"] * trades["size"]
     whale_trades = trades[trades["notional"] >= WHALE_MIN_NOTIONAL].copy()
 
     if whale_trades.empty:
         logging.warning("whale_signal: no trades above WHALE_MIN_NOTIONAL threshold.")
         return neutral
+    
+    print(f"DEBUG: Whale Trade IDs found: {len(whale_trades)}")
+    
+    # # Filter to crypto-relevant markets
+    # if not markets.empty and "category" in markets.columns:
+    #     crypto_market_ids = set(
+    #         markets[markets["category"].str.lower().str.contains("|".join(MACRO_CRYPTO_CATEGORIES))]["market_id"]
+    #     )
+    #     print(f"DEBUG: Crypto Market IDs found: {len(crypto_market_ids)}")
+    #     whale_trades = whale_trades[whale_trades["market_id"].isin(crypto_market_ids)]
 
-    # ── Filter to crypto-relevant markets ────────────────────────────────────
-    if not markets.empty and "category" in markets.columns:
-        crypto_market_ids = set(
-            markets[markets["category"].str.lower().isin(MACRO_CRYPTO_CATEGORIES)]["market_id"]
-        )
-        whale_trades = whale_trades[whale_trades["market_id"].isin(crypto_market_ids)]
+    # if whale_trades.empty:
+    #     logging.warning("whale_signal: no whale trades in crypto-relevant markets.")
+    #     return neutral
 
-    if whale_trades.empty:
-        logging.warning("whale_signal: no whale trades in crypto-relevant markets.")
-        return neutral
-
-    # ── Assign outcome polarity ───────────────────────────────────────────────
-    # Bullish outcome keywords: "yes", "above", "higher", "over", "bull", "moon"
-    # Bearish outcome keywords: "no", "below", "lower", "under", "bear"
+    # Assign outcome 
     BULLISH_KEYWORDS = {"yes", "above", "higher", "over", "bull", "up", "moon", "win"}
     BEARISH_KEYWORDS = {"no", "below", "lower", "under", "bear", "down", "lose", "fall"}
 
@@ -422,9 +396,9 @@ def load_whale_signal(
         )
         whale_trades["is_bullish"] = whale_trades["is_bullish"].fillna(0)
     else:
-        whale_trades["is_bullish"] = 0  # Can't determine polarity without tokens
+        whale_trades["is_bullish"] = 0  
 
-    # ── Compute directional mass ──────────────────────────────────────────────
+    #Compute directional mass 
     # side=BUY → +1, side=SELL → -1
     whale_trades["side_sign"] = whale_trades["side"].map({"BUY": 1, "SELL": -1}).fillna(0)
 
@@ -440,7 +414,7 @@ def load_whale_signal(
         .reindex(index, fill_value=0.0)
     )
 
-    # ── Smooth and normalise ──────────────────────────────────────────────────
+    # normalize
     whale_ema = daily_whale.ewm(span=WHALE_EMA_SPAN, adjust=False).mean()
     whale_z = zscore(whale_ema.to_frame(name="w"), WHALE_ZSCORE_WINDOW)["w"]
     whale_signal = whale_z.clip(-WHALE_CLIP, WHALE_CLIP).fillna(0.0)
@@ -471,13 +445,6 @@ def load_risk_regime_modifier(
     This is applied as a MULTIPLICATIVE FILTER on the MVRV value signal component,
     not as an independent additive signal, to avoid spurious alpha claims.
 
-    No look-ahead: uses only daily aggregates that would be available at market
-    close on day T, lagged by 1 day in precompute_features().
-
-    Args:
-        odds_df: DataFrame from finance_politics_odds_history.parquet.
-                 Columns: timestamp, market_id, token_id, price.
-        index: Target date index.
 
     Returns:
         Daily risk_regime_modifier series. Values:
@@ -504,7 +471,7 @@ def load_risk_regime_modifier(
 
     # Normalise timestamps to daily 
     odds["date"] = pd.to_datetime(odds["timestamp"], utc=True, errors="coerce").dt.tz_localize(None).dt.normalize()
-    odds = odds.dropna(subset=["date", "price"])
+    daily_close = odds.dropna(subset=["date", "price"])
 
     # Logit Transformation & Volatility 
     # Clip to avoid log(0)
@@ -521,7 +488,7 @@ def load_risk_regime_modifier(
     )
 
 
-    # Cross-market daily mean volatility → the "risk index"
+    # Cross-market daily mean volatility - risk index
     risk_index = (
         daily_close.groupby("date")["logit_vol_7d"]
         .mean()
@@ -530,12 +497,12 @@ def load_risk_regime_modifier(
         .fillna(0.0)
     )
 
-    # ── Rolling z-score normalisation ────────────────────────────────────────
+    #Rolling z-score normalisation
     risk_z = zscore(
         risk_index.to_frame(name="r"), RISK_ZSCORE_WINDOW
     )["r"].clip(-3, 3).fillna(0.0)
 
-    # ── Map to regime modifier ────────────────────────────────────────────────
+    # Map to regime modifier
     modifier = np.where(
         risk_z > RISK_HIGH_THRESHOLD,
         RISK_HIGH_DAMPEN,    # Bull/elevated regime → dampen MVRV buy signal
@@ -560,15 +527,8 @@ def precompute_features(df: pd.DataFrame) -> pd.DataFrame:
     Extends example_1's precompute_features() with four new signals.
     ALL signal columns are lagged 1 day to prevent look-ahead bias.
 
-    Data columns expected in df (CoinMetrics merged dataset):
-      Required:  PriceUSD_coinmetrics
-      Optional:  CapMVRVCur, FlowInExUSD, FlowOutExUSD, AdrActCnt
-
     Polymarket data is loaded internally via load_polymarket_data()
     (same pattern as example_1).
-
-    Args:
-        df: DataFrame with CoinMetrics columns, DatetimeIndex.
 
     Returns:
         DataFrame with all feature columns, indexed by date.
@@ -577,13 +537,13 @@ def precompute_features(df: pd.DataFrame) -> pd.DataFrame:
     if PRICE_COL not in df.columns:
         raise KeyError(f"'{PRICE_COL}' not found. Available: {list(df.columns)}")
 
-    # ── Price and MA (unchanged from example_1) ──────────────────────────────
+    # Price and MA (unchanged from example_1)
     price = df[PRICE_COL].loc["2010-07-18":].copy()
     ma = price.rolling(MA_WINDOW, min_periods=MA_WINDOW // 2).mean()
     with np.errstate(divide="ignore", invalid="ignore"):
         price_vs_ma = ((price / ma) - 1).clip(-1, 1).fillna(0)
 
-    # ── MVRV features (unchanged from example_1) ─────────────────────────────
+    # MVRV features (unchanged from example_1)
     if MVRV_COL in df.columns:
         mvrv = df[MVRV_COL].loc[price.index]
         mvrv_z = zscore(mvrv, MVRV_ROLLING_WINDOW).clip(-4, 4)
@@ -603,7 +563,7 @@ def precompute_features(df: pd.DataFrame) -> pd.DataFrame:
         mvrv_zone = pd.Series(0, index=price.index)
         mvrv_volatility = pd.Series(0.5, index=price.index)
 
-    # # ── Existing PM BTC sentiment (unchanged from example_1) ─────────────────
+    # # Existing PM BTC sentiment (unchanged from example_1) 
     # try:
     #     pm_btc_df = load_polymarket_btc_sentiment()
     #     polymarket_sentiment = (
@@ -614,11 +574,11 @@ def precompute_features(df: pd.DataFrame) -> pd.DataFrame:
     #     logging.warning(f"PM BTC sentiment unavailable: {e}")
     #     polymarket_sentiment = pd.Series(0.5, index=price.index)
 
-    # ── Signal 1: Active churn ────────────────────────────────────────────────
+    # Signal 1: Active churn
     # Computed from on-chain columns already in df — no external load needed
     churn_raw = compute_churn_signal(df.loc[price.index])
 
-    # ── Load Polymarket data (shared for signals 2, 3, 4) ────────────────────
+    # Load Polymarket data (shared for signals 2, 3, 4)
     polymarket_data = {}
     try:
         polymarket_data = load_polymarket_data() or {}
@@ -628,9 +588,24 @@ def precompute_features(df: pd.DataFrame) -> pd.DataFrame:
     markets_df_pd = _to_pandas(polymarket_data.get("markets"))
     trades_df_pd = _to_pandas(polymarket_data.get("trades"))
     tokens_df_pd = _to_pandas(polymarket_data.get("tokens"))
-    odds_df_pd = _to_pandas(polymarket_data.get("odds"))
+    odds_df_pd = _to_pandas(polymarket_data.get("odds_history"))
 
-    # ── Signal 2: Macro event modifier ───────────────────────────────────────
+    if tokens_df_pd is not None:
+        print(f"DEBUG: tokens_df_pd row count: {len(tokens_df_pd)}")
+    else:
+        print("DEBUG: tokens_df_pd is NONE")
+    
+    if odds_df_pd is not None:
+        print(f"DEBUG: odds_df_pd row count: {len(odds_df_pd)}")
+    else:
+        print("DEBUG: odds_df_pd is NONE")
+    
+    if trades_df_pd is not None:
+        print(f"DEBUG: trades_df_pd row count: {len(trades_df_pd)}")
+    else:
+        print("DEBUG: trades_df_pd is NONE")
+
+    # Signal 2: Macro event modifier 
     try:
         macro_features = load_macro_event_features(markets_df_pd, price.index)
         macro_modifier_raw = macro_features["macro_modifier"]
@@ -638,21 +613,21 @@ def precompute_features(df: pd.DataFrame) -> pd.DataFrame:
         logging.warning(f"macro_modifier failed: {e}")
         macro_modifier_raw = pd.Series(1.0, index=price.index)
 
-    # ── Signal 3: Whale smart money ───────────────────────────────────────────
+    # Signal 3: Whale smart money 
     try:
         whale_raw = load_whale_signal(trades_df_pd, tokens_df_pd, markets_df_pd, price.index)
     except Exception as e:
         logging.warning(f"whale_signal failed: {e}")
         whale_raw = pd.Series(0.0, index=price.index)
 
-    # ── Signal 4: Risk regime modifier ───────────────────────────────────────
+    # Signal 4: Risk regime modifier 
     try:
         risk_raw = load_risk_regime_modifier(odds_df_pd, price.index,tokens_df_pd)
     except Exception as e:
         logging.warning(f"risk_regime_modifier failed: {e}")
         risk_raw = pd.Series(1.0, index=price.index)
 
-    # ── Assemble pre-lag DataFrame ────────────────────────────────────────────
+    # Assemble pre-lag DataFrame 
     features = pd.DataFrame(
         {
             PRICE_COL: price,
@@ -675,7 +650,7 @@ def precompute_features(df: pd.DataFrame) -> pd.DataFrame:
         index=price.index,
     )
 
-    # ── Lag all signal columns by 1 day (no look-ahead bias) ─────────────────
+    # Lag all signal columns by 1 day (no look-ahead bias) 
     signal_cols = [
         "price_vs_ma",
         "mvrv_zscore",
@@ -691,7 +666,7 @@ def precompute_features(df: pd.DataFrame) -> pd.DataFrame:
     ]
     features[signal_cols] = features[signal_cols].shift(1)
 
-    # ── Fill NaN with safe defaults ───────────────────────────────────────────
+    # Fill NaN 
     features["mvrv_zone"] = features["mvrv_zone"].fillna(0)
     features["mvrv_volatility"] = features["mvrv_volatility"].fillna(0.5)
     #features["polymarket_sentiment"] = features["polymarket_sentiment"].fillna(0.5)
@@ -701,7 +676,7 @@ def precompute_features(df: pd.DataFrame) -> pd.DataFrame:
     features["risk_regime_modifier"] = features["risk_regime_modifier"].fillna(1.0)
     features = features.fillna(0)
 
-    # ── Signal confidence (uses already-lagged values) ────────────────────────
+    # Signal confidence (uses already-lagged values)
     features["signal_confidence"] = compute_signal_confidence(
         features["mvrv_zscore"].values,
         features["mvrv_gradient"].values,
@@ -766,7 +741,7 @@ def compute_dynamic_multiplier(
     """
     n = len(mvrv_zscore)
 
-    # ── Defaults for optional parameters ─────────────────────────────────────
+    #Defaults for optional parameters 
     if mvrv_acceleration is None:
         mvrv_acceleration = np.zeros(n)
     if mvrv_volatility is None:
@@ -784,44 +759,44 @@ def compute_dynamic_multiplier(
     if risk_regime_modifier is None:
         risk_regime_modifier = np.ones(n)
 
-    # ── 1. MVRV value signal (Signal 4 regime filter applied here) ────────────
+    #  1. MVRV value signal (Signal 4 regime filter applied here) 
     value_signal = -mvrv_zscore
     extreme_boost = compute_asymmetric_extreme_boost(mvrv_zscore)
     value_signal = (value_signal + extreme_boost) * risk_regime_modifier
     # risk_regime_modifier > 1 in bear regime (amplify buy), < 1 in bull regime (dampen)
 
-    # ── 2. MA signal with adaptive trend modulation ───────────────────────────
+    #  2. MA signal with adaptive trend modulation 
     ma_signal = -price_vs_ma
     trend_modifier = compute_adaptive_trend_modifier(mvrv_gradient, mvrv_zscore)
     ma_signal = ma_signal * trend_modifier
 
-    # ── 3. PM BTC sentiment (re-centred from [0,1] to [-0.1, 0.1]) ───────────
+    #  3. PM BTC sentiment (re-centred from [0,1] to [-0.1, 0.1]) 
     #polymarket_signal = (polymarket_sentiment - 0.5) * 0.2
 
-    # ── 4. Active churn signal (Signal 1) ────────────────────────────────────
+    #  4. Active churn signal (Signal 1) 
     # Already in approximately [-2, 2]; scale to a reasonable contribution range
     # Positive churn (net outflow + active addrs) = buy more
     churn_contrib = np.tanh(churn_signal * 0.7)  # Soft-clip to ~[-0.6, 0.6]
 
-    # ── 5. Whale signal (Signal 3) ────────────────────────────────────────────
+    #  5. Whale signal (Signal 3) 
     # z-score already in [-2, 2]; scale similarly
     whale_contrib = np.tanh(whale_signal * 0.5)  # Soft-clip to ~[-0.46, 0.46]
 
-    # ── Weighted combination ──────────────────────────────────────────────────
+    #  Weighted combination 
     combined = (
-        value_signal      * W_MVRV           # 40%
+        value_signal      * W_MVRV           # 45%
         + ma_signal       * W_MA             # 12%
         #+ polymarket_signal * W_PM_SENTIMENT  # 8%
-        + churn_contrib   * W_CHURN          # 18%
+        + churn_contrib   * W_CHURN          # 21%
         + whale_contrib   * W_WHALE          # 10%
     )
 
-    # ── Acceleration modifier (from example_1, subtle: [0.85, 1.15]) ─────────
+    # Acceleration modifier (from example_1, subtle: [0.85, 1.15]) 
     accel_modifier = compute_acceleration_modifier(mvrv_acceleration, mvrv_gradient)
     accel_subtle = np.clip(0.85 + 0.30 * (accel_modifier - 0.5) / 0.5, 0.85, 1.15)
     combined = combined * accel_subtle
 
-    # ── Confidence boost (from example_1) ────────────────────────────────────
+    # Confidence boost (from example_1)
     confidence_boost = np.where(
         signal_confidence > 0.7,
         1.0 + 0.15 * (signal_confidence - 0.7) / 0.3,
@@ -829,7 +804,7 @@ def compute_dynamic_multiplier(
     )
     combined = combined * confidence_boost
 
-    # ── MVRV volatility dampening (from example_1) ───────────────────────────
+    #  MVRV volatility dampening (from example_1) 
     volatility_dampening = np.where(
         mvrv_volatility > 0.8,
         1.0 - MVRV_VOLATILITY_DAMPENING * (mvrv_volatility - 0.8) / 0.2,
@@ -837,12 +812,12 @@ def compute_dynamic_multiplier(
     )
     combined = combined * volatility_dampening
 
-    # ── Macro event modifier (Signal 2 — applied last) ────────────────────────
+    # Macro event modifier (Signal 2 — applied last) 
     # This is the outermost gate: reduces position sizing near event resolutions
     # and during "no active event" regimes where downside risk is elevated.
     combined = combined * macro_modifier
 
-    # ── Exponentiate to multiplier ────────────────────────────────────────────
+    # Exponentiate to multiplier 
     adjustment = combined * DYNAMIC_STRENGTH
     adjustment = np.clip(adjustment, -5, 100)
     multiplier = np.exp(adjustment)
@@ -889,9 +864,9 @@ def compute_weights_fast(
             return arr
         return np.full(n, default)
 
-    price_vs_ma      = _get("price_vs_ma", 0.0)
-    mvrv_zscore      = _get("mvrv_zscore", 0.0)
-    mvrv_gradient    = _get("mvrv_gradient", 0.0)
+    price_vs_ma = _get("price_vs_ma", 0.0)
+    mvrv_zscore = _get("mvrv_zscore", 0.0)
+    mvrv_gradient = _get("mvrv_gradient", 0.0)
     mvrv_acceleration = _get("mvrv_acceleration", 0.0)
     mvrv_volatility  = np.where(
         _get("mvrv_volatility", 0.5) == 0, 0.5, _get("mvrv_volatility", 0.5)
@@ -902,11 +877,11 @@ def compute_weights_fast(
     # polymarket_sentiment = np.where(
     #     _get("polymarket_sentiment", 0.5) == 0, 0.5, _get("polymarket_sentiment", 0.5)
     # )
-    churn_signal         = _get("churn_signal", 0.0)
-    macro_modifier       = np.where(
+    churn_signal = _get("churn_signal", 0.0)
+    macro_modifier = np.where(
         _get("macro_modifier", 1.0) == 0, 1.0, _get("macro_modifier", 1.0)
     )
-    whale_signal         = _get("whale_signal", 0.0)
+    whale_signal = _get("whale_signal", 0.0)
     risk_regime_modifier = np.where(
         _get("risk_regime_modifier", 1.0) == 0, 1.0, _get("risk_regime_modifier", 1.0)
     )
