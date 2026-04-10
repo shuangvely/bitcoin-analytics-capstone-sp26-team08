@@ -115,7 +115,7 @@ MACRO_PROXIMITY_MIN = 0.60      # Floor for proximity dampener (day before resol
 SIGNIFICANCE_THRESHOLD = 10000  # $10k minimum volume to be considered "Macro"
 
 # Signal 3: Whale smart money
-WHALE_MIN_NOTIONAL = 10000      # USD notional threshold for "big bet"
+WHALE_MIN_NOTIONAL = 20000      # USD notional threshold for "big bet"
 WHALE_EMA_SPAN = 7              # Smoothing span in days
 WHALE_ZSCORE_WINDOW = 90        # Normalisation window
 WHALE_CLIP = 2.0                # Clip whale z-score to ±2
@@ -133,7 +133,7 @@ W_MVRV = 0.45
 W_MA = 0.12
 #W_PM_SENTIMENT = 0.08
 W_CHURN = 0.21
-W_WHALE = 0.10
+W_WHALE = 0.1
 # Macro modifier and risk-regime filter are multiplicative, not additive.
 # The remaining 0.12 is absorbed by those two gates naturally.
 
@@ -368,18 +368,8 @@ def load_whale_signal(
         return neutral
     
     print(f"DEBUG: Whale Trade IDs found: {len(whale_trades)}")
-    
-    # # Filter to crypto-relevant markets
-    # if not markets.empty and "category" in markets.columns:
-    #     crypto_market_ids = set(
-    #         markets[markets["category"].str.lower().str.contains("|".join(MACRO_CRYPTO_CATEGORIES))]["market_id"]
-    #     )
-    #     print(f"DEBUG: Crypto Market IDs found: {len(crypto_market_ids)}")
-    #     whale_trades = whale_trades[whale_trades["market_id"].isin(crypto_market_ids)]
 
-    # if whale_trades.empty:
-    #     logging.warning("whale_signal: no whale trades in crypto-relevant markets.")
-    #     return neutral
+    
 
     # Assign outcome 
     BULLISH_KEYWORDS = {"yes", "above", "higher", "over", "bull", "up", "moon", "win"}
