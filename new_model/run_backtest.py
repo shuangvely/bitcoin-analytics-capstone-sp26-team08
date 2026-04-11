@@ -27,6 +27,8 @@ def compute_weights_wrapper(df_window: pd.DataFrame) -> pd.Series:
         return pd.Series(dtype=float)
 
     start_date = df_window.index.min()
+    #try a more recent period
+    #start_date = pd.Timestamp("2023-01-01")
     end_date = df_window.index.max()
     
     # For backtesting, current_date = end_date (all dates are in the past)
@@ -66,6 +68,7 @@ def main():
         output_dir=output_dir,
         strategy_label="New Model (Polymarket)",
     )
+
 
 if __name__ == "__main__":
     main()

@@ -41,6 +41,10 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import os
+print("MODEL FILE ACTUALLY LOADED:", __file__)
+print("MODEL FILE MTIME:", os.path.getmtime(__file__))
+print("SENTINEL_ABC_123")
 
 # ---------------------------------------------------------------------------
 # Import base functionality — same pattern as example_1
@@ -85,7 +89,7 @@ MA_WINDOW = 200
 MVRV_GRADIENT_WINDOW = 30
 MVRV_ROLLING_WINDOW = 365
 MVRV_ACCEL_WINDOW = 14
-DYNAMIC_STRENGTH = 5.0
+DYNAMIC_STRENGTH = 5
 
 # MVRV zone thresholds (inherited from example_1)
 MVRV_ZONE_DEEP_VALUE = -2.0
@@ -113,6 +117,16 @@ MACRO_EVENT_WINDOW = 30         # Rolling window for event-count percentile
 MACRO_NO_EVENT_DAMPENER = 0.75  # Multiply combined signal when no events active
 MACRO_PROXIMITY_MIN = 0.60      # Floor for proximity dampener (day before resolution)
 SIGNIFICANCE_THRESHOLD = 10000  # $10k minimum volume to be considered "Macro"
+MACRO_STRESS_WINDOW = 30          # rolling window for stress z-score
+MACRO_STRESS_THRESHOLD = 1.2      # z-score above this = elevated crypto stress
+MACRO_STRESS_DAMPENER = 0.65      # multiply combined when stress is high
+MACRO_STRESS_KEYWORDS = [
+    "collapse", "fail", "bankrupt", "insolvent", "crash", "below",
+    "depeg", "shutdown", "default", "liquidat", "contagion",
+    "halted", "frozen", "hack", "exploit", "rug"
+]
+MACRO_VOLUME_SURGE_THRESHOLD = 2.0   # z-score of new market volume = surge
+MACRO_VOLUME_SURGE_DAMPENER  = 0.80  # multiply when volume is surging on new markets
 
 # Signal 3: Whale smart money
 WHALE_MIN_NOTIONAL = 10000      # USD notional threshold for "big bet"
@@ -133,7 +147,7 @@ W_MVRV = 0.45
 W_MA = 0.12
 #W_PM_SENTIMENT = 0.08
 W_CHURN = 0.21
-W_WHALE = 0.10
+W_WHALE = 0.1
 # Macro modifier and risk-regime filter are multiplicative, not additive.
 # The remaining 0.12 is absorbed by those two gates naturally.
 
@@ -200,7 +214,7 @@ def compute_churn_signal(df: pd.DataFrame) -> pd.Series:
 
     # Composite: weight net-flow more heavily; add address activity
     churn = nf_z * CHURN_NETFLOW_WEIGHT + adr_centred * CHURN_ADR_WEIGHT
-
+    print("Churn signal loaded.")
     return churn.fillna(0.0)
 
 
@@ -210,27 +224,26 @@ def compute_churn_signal(df: pd.DataFrame) -> pd.Series:
 
 
 def load_macro_event_features(markets_df: pd.DataFrame, index: pd.DatetimeIndex) -> pd.DataFrame:
-    """Derive two macro-event features from Polymarket markets data.
+    """Derive macro-event features from Polymarket markets data.
 
-    Sub-signal A — proximity_dampener  [MACRO_PROXIMITY_MIN, 1.0]
-        As days_to_resolution shrinks → value decreases toward MACRO_PROXIMITY_MIN.
-        Rationale: price variance narrows near resolution
-        Reduce position-sizing volatility when a major event is imminent.
-
-    Sub-signal B — event_activity_gate  {MACRO_NO_EVENT_DAMPENER, 1.0}
-        No active events → elevated downside risk 
-        Q3-Q4 event intensity → lower drawdown probability → full signal allowed.
-
-    Both sub-signals are combined multiplicatively as macro_modifier.
+    Design goals:
+      1) Near major unresolved events, dampen aggressive buying a bit.
+      2) When there are almost no active events, dampen buying modestly.
+      3) During prolonged crypto stress, stop over-dampening once the stress
+         has persisted long enough (late-crash / exhaustion regime).
 
     Returns:
-        DataFrame with columns [proximity_dampener, event_activity_gate,
-        macro_modifier] on `index`.
+        DataFrame with columns:
+          - proximity_dampener
+          - event_activity_gate
+          - stress_recovery_gate
+          - macro_modifier
     """
     result = pd.DataFrame(
         {
             "proximity_dampener": 1.0,
             "event_activity_gate": 1.0,
+            "stress_recovery_gate": 1.0,
             "macro_modifier": 1.0,
         },
         index=index,
@@ -240,9 +253,10 @@ def load_macro_event_features(markets_df: pd.DataFrame, index: pd.DatetimeIndex)
         logging.warning("macro_event_features: markets_df empty, macro_modifier = 1.0 always.")
         return result
 
-    # Keep only crypto-relevant categories
     relevant = markets_df[
-        markets_df["category"].str.lower().str.contains("|".join(MACRO_CRYPTO_CATEGORIES),na=False)
+        markets_df["category"].str.lower().str.contains(
+            "|".join(MACRO_CRYPTO_CATEGORIES), na=False
+        )
     ].copy()
 
     if relevant.empty:
@@ -252,72 +266,121 @@ def load_macro_event_features(markets_df: pd.DataFrame, index: pd.DatetimeIndex)
     # Ensure datetime columns
     for col in ("created_at", "end_date"):
         if col in relevant.columns:
-            relevant[col] = pd.to_datetime(relevant[col], utc=True, errors="coerce").dt.tz_localize(None)
+            relevant[col] = (
+                pd.to_datetime(relevant[col], utc=True, errors="coerce")
+                .dt.tz_localize(None)
+            )
 
-    relevant = relevant.dropna(subset=["end_date"])
+    relevant = relevant.dropna(subset=["created_at", "end_date"])
 
-    # Sub-signal A: proximity dampener 
-    # For each calendar day, find the minimum days-to-resolution across all
-    # currently active markets. A short fuse = high proximity = low dampener.
+    # Normalize to date boundaries
+    relevant["date_start"] = relevant["created_at"].dt.normalize()
+    relevant["date_end"] = relevant["end_date"].dt.normalize()
     days_index = index.normalize()
 
-    # Build a Series: for each date, min days remaining among open markets
+    # Use significant markets consistently for BOTH proximity and activity
+    significant = relevant[relevant["volume"] >= SIGNIFICANCE_THRESHOLD].copy()
+
+    # ------------------------------------------------------------------
+    # A) Proximity dampener
+    # ------------------------------------------------------------------
     def min_days_remaining(date: pd.Timestamp) -> float:
-        active = relevant[
-            (relevant.get("created_at", pd.Timestamp.min) <= date)
-            & (relevant["end_date"] >= date) &
-            (relevant["volume"] >= SIGNIFICANCE_THRESHOLD) #<--- filter significant event
+        active = significant[
+            (significant["date_start"] <= date) & (significant["date_end"] >= date)
         ]
         if active.empty:
             return np.nan
-        days = (active["end_date"] - date).dt.days
-        return float(days[days >= 0].min()) if (days >= 0).any() else np.nan
+        days = (active["date_end"] - date).dt.days
+        valid = days[days >= 0]
+        return float(valid.min()) if not valid.empty else np.nan
 
-    min_days = pd.Series(
-        [min_days_remaining(d) for d in days_index],
-        index=index,
-        dtype=float,
-    )
+    min_days = pd.Series([min_days_remaining(d) for d in days_index], index=index, dtype=float)
 
-    # Sigmoid-style dampener: far away → 1.0, day-before → MACRO_PROXIMITY_MIN
-    # Formula: dampener = MACRO_PROXIMITY_MIN + (1 - MIN) * (1 - exp(-days/30))
+    # IMPORTANT CHANGE:
+    # If no active significant event exists, proximity should be neutral (=1.0),
+    # not mildly dampened.
+    proximity_dampener = pd.Series(1.0, index=index, dtype=float)
+
+    has_active_event = min_days.notna()
     dampener_range = 1.0 - MACRO_PROXIMITY_MIN
-    proximity_dampener = MACRO_PROXIMITY_MIN + dampener_range * (
-        1.0 - np.exp(-min_days.fillna(60) / 30.0)
-    )
-    proximity_dampener = proximity_dampener.clip(MACRO_PROXIMITY_MIN, 1.0)
+    proximity_dampener.loc[has_active_event] = (
+        MACRO_PROXIMITY_MIN
+        + dampener_range * (1.0 - np.exp(-min_days.loc[has_active_event] / 30.0))
+    ).clip(MACRO_PROXIMITY_MIN, 1.0)
 
-    # Sub-signal B: event activity gate 
-    # Count active markets per day (created_at <= date <= end_date)
-    relevant["date_start"] = relevant["created_at"].dt.normalize()
-    relevant["date_end"] = relevant["end_date"].dt.normalize()
-
-    active_count = pd.Series(0, index=index, dtype=int)
-    for _, row in relevant.iterrows():
+    # ------------------------------------------------------------------
+    # B) Event activity gate
+    # ------------------------------------------------------------------
+    active_count = pd.Series(0, index=index, dtype=float)
+    for _, row in significant.iterrows():
         mask = (index >= row["date_start"]) & (index <= row["date_end"])
-        active_count[mask] += 1
+        active_count.loc[mask] += 1
 
-    # Rolling percentile of active-market-count (30-day window)
     active_pct = (
         active_count.rolling(MACRO_EVENT_WINDOW, min_periods=1)
         .rank(pct=True)
         .fillna(0.5)
     )
 
-    # Gate: below 10th percentile (near zero events) → dampen
-    event_gate = np.where(active_pct < 0.10, MACRO_NO_EVENT_DAMPENER, 1.0)
-    event_gate = pd.Series(event_gate, index=index, dtype=float)
-
-    # Combine
-    result["proximity_dampener"] = proximity_dampener
-    result["event_activity_gate"] = event_gate
-    result["macro_modifier"] = (proximity_dampener * event_gate).clip(
-        MACRO_PROXIMITY_MIN * MACRO_NO_EVENT_DAMPENER, 1.0
+    event_gate = pd.Series(
+        np.where(active_pct < 0.10, MACRO_NO_EVENT_DAMPENER, 1.0),
+        index=index,
+        dtype=float,
     )
 
+    # ------------------------------------------------------------------
+    # C) Stress exhaustion / late-crash recovery gate
+    # ------------------------------------------------------------------
+    # Detect active stress-oriented markets
+    relevant["is_stress"] = relevant["question"].str.lower().str.contains(
+        "|".join(MACRO_STRESS_KEYWORDS), na=False
+    ).astype(int)
+
+    stress_markets = relevant[(relevant["is_stress"] == 1) & (relevant["volume"] >= SIGNIFICANCE_THRESHOLD)].copy()
+
+    active_stress_count = pd.Series(0.0, index=index)
+    for _, row in stress_markets.iterrows():
+        mask = (index >= row["date_start"]) & (index <= row["date_end"])
+        active_stress_count.loc[mask] += 1
+
+    # Stress ratio among significant active events
+    stress_ratio = (active_stress_count / active_count.replace(0, np.nan)).fillna(0.0)
+
+    # Persistent stress = not a fresh shock anymore
+    stress_persistent = (
+        stress_ratio.rolling(21, min_periods=7).mean().fillna(0.0) > 0.10
+    )
+
+    # Fresh stress shock = short-term fear spike
+    fresh_stress = stress_ratio > 0.10
+
+    # By default:
+    # - fresh stress => mild dampening
+    # - persistent stress => remove dampening (late-crash accumulation logic)
+    stress_recovery_gate = pd.Series(1.0, index=index, dtype=float)
+    stress_recovery_gate.loc[fresh_stress] = 0.85
+    stress_recovery_gate.loc[stress_persistent] = 1.00
+
+    # ------------------------------------------------------------------
+    # Final combine
+    # ------------------------------------------------------------------
+    macro_modifier = (
+        proximity_dampener * event_gate * stress_recovery_gate
+    ).clip(0.75 * MACRO_PROXIMITY_MIN, 1.0)
+
+    result["proximity_dampener"] = proximity_dampener
+    result["event_activity_gate"] = event_gate
+    result["stress_recovery_gate"] = stress_recovery_gate
+    result["macro_modifier"] = macro_modifier
+
+    print("macro modifier describe")
+    print(result["macro_modifier"].describe())
+    print("event gate counts")
+    print(result["event_activity_gate"].value_counts(dropna=False))
+    print("stress recovery counts")
+    print(result["stress_recovery_gate"].value_counts(dropna=False))
+
     return result
-
-
 # =============================================================================
 # Signal 3 — Whale Smart Money  (Polymarket trades)
 # =============================================================================
@@ -368,18 +431,7 @@ def load_whale_signal(
         return neutral
     
     print(f"DEBUG: Whale Trade IDs found: {len(whale_trades)}")
-    
-    # # Filter to crypto-relevant markets
-    # if not markets.empty and "category" in markets.columns:
-    #     crypto_market_ids = set(
-    #         markets[markets["category"].str.lower().str.contains("|".join(MACRO_CRYPTO_CATEGORIES))]["market_id"]
-    #     )
-    #     print(f"DEBUG: Crypto Market IDs found: {len(crypto_market_ids)}")
-    #     whale_trades = whale_trades[whale_trades["market_id"].isin(crypto_market_ids)]
-
-    # if whale_trades.empty:
-    #     logging.warning("whale_signal: no whale trades in crypto-relevant markets.")
-    #     return neutral
+ 
 
     # Assign outcome 
     BULLISH_KEYWORDS = {"yes", "above", "higher", "over", "bull", "up", "moon", "win"}
@@ -394,6 +446,9 @@ def load_whale_signal(
         whale_trades = whale_trades.merge(
             tokens[["token_id", "is_bullish"]], on="token_id", how="left"
         )
+        print("whale trades:", len(whale_trades))
+        print("matched token polarity:", whale_trades["is_bullish"].notna().sum())
+        print("nonzero polarity:", (whale_trades["is_bullish"] != 0).sum())
         whale_trades["is_bullish"] = whale_trades["is_bullish"].fillna(0)
     else:
         whale_trades["is_bullish"] = 0  
@@ -418,6 +473,9 @@ def load_whale_signal(
     whale_ema = daily_whale.ewm(span=WHALE_EMA_SPAN, adjust=False).mean()
     whale_z = zscore(whale_ema.to_frame(name="w"), WHALE_ZSCORE_WINDOW)["w"]
     whale_signal = whale_z.clip(-WHALE_CLIP, WHALE_CLIP).fillna(0.0)
+
+    print("daily whale nonzero days:", (daily_whale != 0).sum())
+    print("final whale nonzero days:", (whale_signal != 0).sum())
 
     return whale_signal.rename("whale_signal")
 
@@ -609,20 +667,25 @@ def precompute_features(df: pd.DataFrame) -> pd.DataFrame:
     try:
         macro_features = load_macro_event_features(markets_df_pd, price.index)
         macro_modifier_raw = macro_features["macro_modifier"]
+
+        print("DEBUG: macro event feature loaded")
     except Exception as e:
         logging.warning(f"macro_modifier failed: {e}")
         macro_modifier_raw = pd.Series(1.0, index=price.index)
 
+
     # Signal 3: Whale smart money 
     try:
         whale_raw = load_whale_signal(trades_df_pd, tokens_df_pd, markets_df_pd, price.index)
+        print("DEBUG: whale feature loaded")
     except Exception as e:
         logging.warning(f"whale_signal failed: {e}")
         whale_raw = pd.Series(0.0, index=price.index)
-
+ 
     # Signal 4: Risk regime modifier 
     try:
         risk_raw = load_risk_regime_modifier(odds_df_pd, price.index,tokens_df_pd)
+        print("DEBUG: risk feature loaded")
     except Exception as e:
         logging.warning(f"risk_regime_modifier failed: {e}")
         risk_raw = pd.Series(1.0, index=price.index)
@@ -709,10 +772,10 @@ def compute_dynamic_multiplier(
 
     Signal architecture:
       Additive core (weighted sum → combined):
-        MVRV value signal     40%  — core valuation, asymmetric extreme boost
+        MVRV value signal     45%  — core valuation, asymmetric extreme boost
         200-day MA signal     12%  — trend context, adaptive trend modifier
-        PM BTC sentiment       8%  — new-market activity on Polymarket
-        Active churn          18%  — moderate outflow + active addresses (Signal 1)
+        PM BTC sentiment       0%  — new-market activity on Polymarket
+        Active churn          21%  — moderate outflow + active addresses (Signal 1)
         Whale signal          10%  — size-weighted big-bet direction (Signal 3)
 
       Multiplicative gates (applied to combined after weighting):
@@ -784,11 +847,10 @@ def compute_dynamic_multiplier(
 
     #  Weighted combination 
     combined = (
-        value_signal      * W_MVRV           # 45%
-        + ma_signal       * W_MA             # 12%
-        #+ polymarket_signal * W_PM_SENTIMENT  # 8%
-        + churn_contrib   * W_CHURN          # 21%
-        + whale_contrib   * W_WHALE          # 10%
+        value_signal      * W_MVRV
+        + ma_signal       * W_MA
+        + churn_contrib   * W_CHURN
+        + whale_contrib   * W_WHALE
     )
 
     # Acceleration modifier (from example_1, subtle: [0.85, 1.15]) 
@@ -815,11 +877,12 @@ def compute_dynamic_multiplier(
     # Macro event modifier (Signal 2 — applied last) 
     # This is the outermost gate: reduces position sizing near event resolutions
     # and during "no active event" regimes where downside risk is elevated.
+    
     combined = combined * macro_modifier
 
     # Exponentiate to multiplier 
     adjustment = combined * DYNAMIC_STRENGTH
-    adjustment = np.clip(adjustment, -5, 100)
+    adjustment = np.clip(adjustment, -5,100)
     multiplier = np.exp(adjustment)
     return np.where(np.isfinite(multiplier), multiplier, 1.0)
 
